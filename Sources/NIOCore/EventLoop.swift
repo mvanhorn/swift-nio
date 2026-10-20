@@ -73,6 +73,26 @@ public final class RepeatedTask {
     private var scheduled: Optional<Scheduled<EventLoopFuture<Void>>>
     private var task: Optional<RepeatedTaskCallback>
 
+    /// `true` while the user callback is on the stack and has not yet returned its future.
+    ///
+    /// Self-cancellation in this window must not fail `scheduled`. Failing that promise drops
+    /// the future the callback is about to return, so completion can no longer be observed.
+    private var executingCallback = false
+
+    /// `true` from the moment a callback is entered until the future it returned has settled
+    /// on this event loop. Cancellation nils `task` immediately so nothing new is scheduled,
+    /// and this flag is kept so later `cancel(promise:)` calls wait for the same execution.
+    private var awaitingExecutionCompletion = false
+
+    /// No further invocation may be scheduled.
+    private var cancelled = false
+
+    /// The creation-time cancellation promise has already been succeeded once.
+    private var didSucceedCancellationPromise = false
+
+    /// Promises supplied to `cancel(promise:)` that have not yet been succeeded.
+    private var pendingCancellationPromises: [EventLoopPromise<Void>] = []
+
     internal init(
         interval: TimeAmount,
         eventLoop: EventLoop,
@@ -98,24 +118,49 @@ public final class RepeatedTask {
 
     private func begin0(in delay: TimeAmount) {
         self.eventLoop.assertInEventLoop()
-        guard let task = self.task else {
+        // Cancellation can be queued ahead of `begin0` when `begin` hopped onto the loop.
+        guard !self.cancelled, self.task != nil else {
             return
         }
+        self.scheduleNext(in: delay)
+    }
+
+    private func scheduleNext(in delay: TimeAmount) {
+        self.eventLoop.assertInEventLoop()
         self.scheduled = self.eventLoop.scheduleTask(in: delay) {
-            task(self)
+            self.invoke()
         }
         self.reschedule()
     }
 
+    /// Invokes the user callback once `scheduled` has fired.
+    ///
+    /// Re-checks `task` because cancellation can win the race against a task that has
+    /// already been popped from the event loop's queue.
+    private func invoke() -> EventLoopFuture<Void> {
+        self.eventLoop.assertInEventLoop()
+        guard !self.cancelled, let task = self.task else {
+            return self.eventLoop.makeSucceededFuture(())
+        }
+        self.executingCallback = true
+        self.awaitingExecutionCompletion = true
+        defer { self.executingCallback = false }
+        return task(self)
+    }
+
     /// Try to cancel the execution of the repeated task.
     ///
-    /// Whether the execution of the task is immediately canceled depends on whether the execution of a task has already begun.
-    ///  This means immediate cancellation is not guaranteed.
+    /// Further scheduling stops immediately. If a callback is running, or if it has returned
+    /// an `EventLoopFuture` that is still pending, cancellation is complete only once that
+    /// callback has returned and the future has settled, successfully or with an error.
+    /// Notification means no invocation is still executing.
     ///
     /// The safest way to cancel is by using the passed reference of `RepeatedTask` inside the task closure.
     ///
     /// If the promise parameter is not `nil`, the passed promise is fulfilled when cancellation is complete.
     /// Passing a promise does not prevent fulfillment of any promise provided on original task creation.
+    /// Each promise is fulfilled once, after that same execution boundary. A call made after cancellation
+    /// has already completed fulfills its promise promptly.
     public func cancel(promise: EventLoopPromise<Void>? = nil) {
         if self.eventLoop.inEventLoop {
             self.cancel0(localCancellationPromise: promise)
@@ -128,29 +173,49 @@ public final class RepeatedTask {
 
     private func cancel0(localCancellationPromise: EventLoopPromise<Void>?) {
         self.eventLoop.assertInEventLoop()
-        self.scheduled?.cancel()
-        self.scheduled = nil
+        if let localCancellationPromise {
+            self.pendingCancellationPromises.append(localCancellationPromise)
+        }
+
+        // Already finished. This promise must not wait for work that will not run again.
+        if self.didSucceedCancellationPromise {
+            self.succeedPendingCancellationPromises()
+            return
+        }
+
+        let alreadyCancelled = self.cancelled
+        self.cancelled = true
         self.task = nil
 
-        // Possible states at this time are:
-        //  1) Task is scheduled but has not yet executed.
-        //  2) Task is currently executing and invoked `cancel()` on itself.
-        //  3) Task is currently executing and `cancel0()` has been reentrantly invoked.
-        //  4) NOT VALID: Task is currently executing and has NOT invoked `cancel()` (`EventLoop` guarantees serial execution)
-        //  5) NOT VALID: Task has completed execution in a success state (`reschedule()` ensures state #2).
-        //  6) Task has completed execution in a failure state.
-        //  7) Task has been fully cancelled at a previous time.
-        //
-        // It is desirable that the task has fully completed any execution before any cancellation promise is
-        // fulfilled. States 2 and 3 occur during execution, so the requirement is implemented by deferring
-        // fulfillment to the next `EventLoop` cycle. The delay is harmless to other states and distinguishing
-        // them from 2 and 3 is not practical (or necessarily possible), so is used unconditionally. Check the
-        // promises for nil so as not to otherwise invoke `execute()` unnecessarily.
-        if self.cancellationPromise != nil || localCancellationPromise != nil {
-            self.eventLoop.execute {
-                self.cancellationPromise?.succeed(())
-                localCancellationPromise?.succeed(())
-            }
+        // Possible states:
+        //  1) Scheduled, but the callback has not started. Fail it so it never runs and notify.
+        //     There is no execution to wait for.
+        //  2) Callback is on the stack, including self-cancellation before it returns a future.
+        //     Do not fail `scheduled`: that would discard the future about to be returned.
+        //     `reschedule` observes that future and notifies from `reschedule0`.
+        //  3) Callback has returned a future that is still pending. `reschedule` is already
+        //     waiting for it (on this loop, success or failure). Keep that completion state
+        //     for later `cancel(promise:)` calls; notify from `reschedule0`.
+        //  4) Cancellation was already requested and state 2 or 3 is still in progress.
+        //     The new promise joins the same boundary. Do not succeed the creation-time
+        //     promise again.
+        //  5) Cancellation has completed. Handled above; a new promise is fulfilled promptly.
+        if self.executingCallback || self.awaitingExecutionCompletion {
+            return
+        }
+
+        if alreadyCancelled {
+            self.finishCancellation()
+            return
+        }
+
+        if let scheduled = self.scheduled {
+            self.scheduled = nil
+            // Failing a not-yet-run task makes `reschedule`'s `whenFailure` finish
+            // cancellation. A promise that has already succeeded ignores `fail`.
+            scheduled.cancel()
+        } else {
+            self.finishCancellation()
         }
     }
 
@@ -161,29 +226,70 @@ public final class RepeatedTask {
         }
 
         scheduled.futureResult.whenSuccess { future in
+            // The invocation is complete when the callback's future settles on this loop,
+            // whether it succeeds or fails. That boundary, not the next loop turn, is when
+            // a cancelled task may be notified.
             future.hop(to: self.eventLoop).whenComplete { (_: Result<Void, Error>) in
                 self.reschedule0()
             }
         }
 
         scheduled.futureResult.whenFailure { (_: Error) in
-            self.cancel0(localCancellationPromise: nil)
+            // Cancelled before the callback ran, or the scheduled task failed closed.
+            // No returned future exists to wait for.
+            self.invocationDidNotStart()
         }
+    }
+
+    private func invocationDidNotStart() {
+        self.eventLoop.assertInEventLoop()
+        self.awaitingExecutionCompletion = false
+        self.scheduled = nil
+        self.cancelled = true
+        self.task = nil
+        self.finishCancellation()
     }
 
     private func reschedule0() {
         self.eventLoop.assertInEventLoop()
-        guard self.task != nil else {
+        self.awaitingExecutionCompletion = false
+        self.scheduled = nil
+
+        guard !self.cancelled, self.task != nil else {
+            self.finishCancellation()
             return
         }
-        self.scheduled = self.eventLoop.scheduleTask(in: self.delay) {
-            // we need to repeat this as we might have been cancelled in the meantime
-            guard let task = self.task else {
-                return self.eventLoop.makeSucceededFuture(())
-            }
-            return task(self)
+        self.scheduleNext(in: self.delay)
+    }
+
+    private func finishCancellation() {
+        self.eventLoop.assertInEventLoop()
+        guard self.cancelled, !self.executingCallback, !self.awaitingExecutionCompletion else {
+            return
         }
-        self.reschedule()
+        guard !self.didSucceedCancellationPromise else {
+            self.succeedPendingCancellationPromises()
+            return
+        }
+
+        self.didSucceedCancellationPromise = true
+        self.scheduled = nil
+        self.task = nil
+        // Succeed the creation-time promise before draining `cancel(promise:)` promises so a
+        // re-entrant cancel observes a single creation-time completion and joins the drain.
+        self.cancellationPromise?.succeed(())
+        self.succeedPendingCancellationPromises()
+    }
+
+    private func succeedPendingCancellationPromises() {
+        self.eventLoop.assertInEventLoop()
+        while !self.pendingCancellationPromises.isEmpty {
+            let promises = self.pendingCancellationPromises
+            self.pendingCancellationPromises = []
+            for promise in promises {
+                promise.succeed(())
+            }
+        }
     }
 }
 
@@ -1336,7 +1442,8 @@ extension EventLoop {
     /// - Parameters:
     ///   - initialDelay: The delay after which the first task is executed.
     ///   - delay: The delay between the end of one task and the start of the next.
-    ///   - promise: If non-nil, a promise to fulfill when the task is cancelled and all execution is complete.
+    ///   - promise: If non-nil, a promise to fulfill when the task is cancelled and all execution is complete,
+    ///             including settlement of the future returned by any in-flight callback.
     ///   - task: The closure that will be executed. Task will keep repeating regardless of whether the future
     ///             gets fulfilled with success or error.
     ///
@@ -1364,7 +1471,8 @@ extension EventLoop {
     ///   - initialDelay: The delay after which the first task is executed.
     ///   - delay: The delay between the end of one task and the start of the next.
     ///   - maximumAllowableJitter: Exclusive upper bound of jitter range added to the `delay` parameter.
-    ///   - promise: If non-nil, a promise to fulfill when the task is cancelled and all execution is complete.
+    ///   - promise: If non-nil, a promise to fulfill when the task is cancelled and all execution is complete,
+    ///             including settlement of the future returned by any in-flight callback.
     ///   - task: The closure that will be executed. Task will keep repeating regardless of whether the future
     ///             gets fulfilled with success or error.
     ///

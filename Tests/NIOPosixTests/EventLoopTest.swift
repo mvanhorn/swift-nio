@@ -1034,6 +1034,349 @@ final class MultiThreadedEventLoopGroupTests {
     }
 
     @Test
+    func testRepeatedAsyncTaskCancellationWaitsForPendingWork() throws {
+        let loop = EmbeddedEventLoop()
+        let work = loop.makePromise(of: Void.self)
+        let notifying = loop.makePromise(of: Void.self)
+        let cancelPromise = loop.makePromise(of: Void.self)
+        let runs = NIOLoopBoundBox(0, eventLoop: loop)
+
+        let task = loop.scheduleRepeatedAsyncTask(
+            initialDelay: .zero,
+            delay: .seconds(1),
+            notifying: notifying
+        ) { _ in
+            runs.value += 1
+            return work.futureResult
+        }
+
+        loop.run()
+        #expect(runs.value == 1)
+
+        task.cancel(promise: cancelPromise)
+        loop.run()
+        loop.run()
+        #expect(!notifying.futureResult.isFulfilled)
+        #expect(!cancelPromise.futureResult.isFulfilled)
+
+        work.succeed(())
+        loop.run()
+        #expect(notifying.futureResult.isFulfilled)
+        #expect(cancelPromise.futureResult.isFulfilled)
+
+        loop.advanceTime(by: .hours(1))
+        #expect(runs.value == 1)
+    }
+
+    @Test
+    func testRepeatedAsyncTaskCancellationWaitsForFailedWork() throws {
+        let loop = EmbeddedEventLoop()
+        let work = loop.makePromise(of: Void.self)
+        let notifying = loop.makePromise(of: Void.self)
+        let cancelPromise = loop.makePromise(of: Void.self)
+        let runs = NIOLoopBoundBox(0, eventLoop: loop)
+        let notifyingSucceeded = NIOLoopBoundBox(false, eventLoop: loop)
+        notifying.futureResult.assumeIsolated().whenSuccess { notifyingSucceeded.value = true }
+
+        let task = loop.scheduleRepeatedAsyncTask(
+            initialDelay: .zero,
+            delay: .seconds(1),
+            notifying: notifying
+        ) { _ in
+            runs.value += 1
+            return work.futureResult
+        }
+        loop.run()
+        #expect(runs.value == 1)
+
+        task.cancel(promise: cancelPromise)
+        loop.run()
+        loop.run()
+        #expect(!notifying.futureResult.isFulfilled)
+        #expect(!cancelPromise.futureResult.isFulfilled)
+
+        struct Failure: Error {}
+        work.fail(Failure())
+        loop.run()
+        #expect(notifyingSucceeded.value)
+        #expect(cancelPromise.futureResult.isFulfilled)
+        loop.advanceTime(by: .hours(1))
+        #expect(runs.value == 1)
+    }
+
+    @Test
+    func testRepeatedAsyncTaskCancellationOfAlreadyCompletedFuture() throws {
+        let loop = EmbeddedEventLoop()
+        let notifying = loop.makePromise(of: Void.self)
+        let cancelPromise = loop.makePromise(of: Void.self)
+        let runs = NIOLoopBoundBox(0, eventLoop: loop)
+        let notifyingSucceeded = NIOLoopBoundBox(false, eventLoop: loop)
+        notifying.futureResult.assumeIsolated().whenSuccess { notifyingSucceeded.value = true }
+
+        loop.scheduleRepeatedAsyncTask(
+            initialDelay: .zero,
+            delay: .seconds(5),
+            notifying: notifying
+        ) { task in
+            runs.value += 1
+            task.cancel(promise: cancelPromise)
+            struct Failure: Error {}
+            return loop.makeFailedFuture(Failure())
+        }
+
+        loop.run()
+        #expect(runs.value == 1)
+        #expect(notifyingSucceeded.value)
+        #expect(cancelPromise.futureResult.isFulfilled)
+        loop.advanceTime(by: .hours(1))
+        #expect(runs.value == 1)
+
+        let succeededLoop = EmbeddedEventLoop()
+        let succeededNotifying = succeededLoop.makePromise(of: Void.self)
+        let succeededCancel = succeededLoop.makePromise(of: Void.self)
+        let succeededRuns = NIOLoopBoundBox(0, eventLoop: succeededLoop)
+        let succeededTask = succeededLoop.scheduleRepeatedAsyncTask(
+            initialDelay: .zero,
+            delay: .seconds(5),
+            notifying: succeededNotifying
+        ) { _ in
+            succeededRuns.value += 1
+            return succeededLoop.makeSucceededFuture(())
+        }
+        succeededLoop.run()
+        #expect(succeededRuns.value == 1)
+        succeededTask.cancel(promise: succeededCancel)
+        succeededLoop.run()
+        #expect(succeededNotifying.futureResult.isFulfilled)
+        #expect(succeededCancel.futureResult.isFulfilled)
+        succeededLoop.advanceTime(by: .hours(1))
+        #expect(succeededRuns.value == 1)
+    }
+
+    @Test
+    func testRepeatedAsyncTaskSelfCancelWaitsForPendingFuture() throws {
+        let loop = EmbeddedEventLoop()
+        let work = loop.makePromise(of: Void.self)
+        let notifying = loop.makePromise(of: Void.self)
+        let cancelPromise = loop.makePromise(of: Void.self)
+        let runs = NIOLoopBoundBox(0, eventLoop: loop)
+
+        loop.scheduleRepeatedAsyncTask(
+            initialDelay: .zero,
+            delay: .seconds(1),
+            notifying: notifying
+        ) { task in
+            runs.value += 1
+            task.cancel(promise: cancelPromise)
+            return work.futureResult
+        }
+
+        loop.run()
+        loop.run()
+        #expect(runs.value == 1)
+        #expect(!notifying.futureResult.isFulfilled)
+        #expect(!cancelPromise.futureResult.isFulfilled)
+
+        work.succeed(())
+        loop.run()
+        #expect(notifying.futureResult.isFulfilled)
+        #expect(cancelPromise.futureResult.isFulfilled)
+        loop.advanceTime(by: .hours(1))
+        #expect(runs.value == 1)
+
+        let laterLoop = EmbeddedEventLoop()
+        let laterNotifying = laterLoop.makePromise(of: Void.self)
+        let laterCancel = laterLoop.makePromise(of: Void.self)
+        let laterRuns = NIOLoopBoundBox(0, eventLoop: laterLoop)
+        let laterWork = NIOLoopBoundBox<EventLoopPromise<Void>?>(nil, eventLoop: laterLoop)
+        laterLoop.scheduleRepeatedAsyncTask(
+            initialDelay: .zero,
+            delay: .milliseconds(5),
+            notifying: laterNotifying
+        ) { task in
+            laterRuns.value += 1
+            if laterRuns.value == 1 {
+                return laterLoop.makeSucceededFuture(())
+            }
+            let promise = laterLoop.makePromise(of: Void.self)
+            laterWork.value = promise
+            task.cancel(promise: laterCancel)
+            return promise.futureResult
+        }
+
+        laterLoop.advanceTime(by: .milliseconds(5))
+        laterLoop.run()
+        #expect(laterRuns.value == 2)
+        #expect(!laterNotifying.futureResult.isFulfilled)
+        #expect(!laterCancel.futureResult.isFulfilled)
+
+        laterWork.value?.succeed(())
+        laterLoop.run()
+        #expect(laterNotifying.futureResult.isFulfilled)
+        #expect(laterCancel.futureResult.isFulfilled)
+        laterLoop.advanceTime(by: .hours(1))
+        #expect(laterRuns.value == 2)
+    }
+
+    @Test
+    func testRepeatedAsyncTaskRepeatedCancellationWaitsForTheSameWork() throws {
+        let loop = EmbeddedEventLoop()
+        let work = loop.makePromise(of: Void.self)
+        let notifying = loop.makePromise(of: Void.self)
+        let first = loop.makePromise(of: Void.self)
+        let second = loop.makePromise(of: Void.self)
+        let notifyingCount = NIOLoopBoundBox(0, eventLoop: loop)
+        let runs = NIOLoopBoundBox(0, eventLoop: loop)
+        notifying.futureResult.assumeIsolated().whenSuccess { notifyingCount.value += 1 }
+
+        let task = loop.scheduleRepeatedAsyncTask(
+            initialDelay: .zero,
+            delay: .seconds(1),
+            notifying: notifying
+        ) { _ in
+            runs.value += 1
+            return work.futureResult
+        }
+        loop.run()
+
+        task.cancel()
+        task.cancel(promise: first)
+        task.cancel(promise: second)
+        loop.run()
+        loop.run()
+        #expect(notifyingCount.value == 0)
+        #expect(!notifying.futureResult.isFulfilled)
+        #expect(!first.futureResult.isFulfilled)
+        #expect(!second.futureResult.isFulfilled)
+
+        work.succeed(())
+        loop.run()
+        #expect(notifyingCount.value == 1)
+        #expect(notifying.futureResult.isFulfilled)
+        #expect(first.futureResult.isFulfilled)
+        #expect(second.futureResult.isFulfilled)
+
+        let afterCompletion = loop.makePromise(of: Void.self)
+        task.cancel(promise: afterCompletion)
+        loop.run()
+        #expect(afterCompletion.futureResult.isFulfilled)
+        #expect(notifyingCount.value == 1)
+        loop.advanceTime(by: .hours(1))
+        #expect(runs.value == 1)
+        #expect(notifyingCount.value == 1)
+    }
+
+    @Test
+    func testRepeatedAsyncTaskCancelBeforeExecutionCompletesWithoutRunning() throws {
+        let loop = EmbeddedEventLoop()
+        let notifying = loop.makePromise(of: Void.self)
+        let cancelPromise = loop.makePromise(of: Void.self)
+        let runs = NIOLoopBoundBox(0, eventLoop: loop)
+        let task = loop.scheduleRepeatedAsyncTask(
+            initialDelay: .seconds(10),
+            delay: .seconds(1),
+            notifying: notifying
+        ) { _ in
+            runs.value += 1
+            return loop.makeSucceededFuture(())
+        }
+
+        task.cancel(promise: cancelPromise)
+        loop.run()
+        #expect(runs.value == 0)
+        #expect(notifying.futureResult.isFulfilled)
+        #expect(cancelPromise.futureResult.isFulfilled)
+        loop.advanceTime(by: .hours(1))
+        #expect(runs.value == 0)
+
+        let between = EmbeddedEventLoop()
+        let betweenNotifying = between.makePromise(of: Void.self)
+        let betweenCancel = between.makePromise(of: Void.self)
+        let betweenRuns = NIOLoopBoundBox(0, eventLoop: between)
+        let betweenTask = between.scheduleRepeatedAsyncTask(
+            initialDelay: .zero,
+            delay: .seconds(10),
+            notifying: betweenNotifying
+        ) { _ in
+            betweenRuns.value += 1
+            return between.makeSucceededFuture(())
+        }
+        between.run()
+        #expect(betweenRuns.value == 1)
+        #expect(!betweenNotifying.futureResult.isFulfilled)
+
+        betweenTask.cancel(promise: betweenCancel)
+        between.run()
+        #expect(betweenNotifying.futureResult.isFulfilled)
+        #expect(betweenCancel.futureResult.isFulfilled)
+        between.advanceTime(by: .hours(1))
+        #expect(betweenRuns.value == 1)
+    }
+
+    @Test
+    func testRepeatedAsyncTaskCancelFromAnotherLoopWaitsForForeignFuture() throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
+        defer {
+            #expect(throws: Never.self) {
+                try group.syncShutdownGracefully()
+            }
+        }
+        let loops = Array(group.makeIterator())
+        let owner = loops[0]
+        let other = loops[1]
+        let work = other.makePromise(of: Void.self)
+        let notifying = owner.makePromise(of: Void.self)
+        let cancelPromise = owner.makePromise(of: Void.self)
+        let runs = NIOLockedValueBox(0)
+        let observedOwner = NIOLockedValueBox(false)
+        let notifiedOnOwner = NIOLockedValueBox(false)
+        let callbackEntered = DispatchGroup()
+        callbackEntered.enter()
+
+        notifying.futureResult.whenSuccess {
+            notifiedOnOwner.withLockedValue { $0 = owner.inEventLoop }
+        }
+
+        let task = owner.scheduleRepeatedAsyncTask(
+            initialDelay: .zero,
+            delay: .hours(1),
+            notifying: notifying
+        ) { _ in
+            #expect(owner.inEventLoop)
+            observedOwner.withLockedValue { $0 = owner.inEventLoop }
+            runs.withLockedValue { $0 += 1 }
+            callbackEntered.leave()
+            return work.futureResult
+        }
+
+        callbackEntered.wait()
+        try owner.submit {}.wait()
+        #expect(observedOwner.withLockedValue { $0 })
+        #expect(runs.withLockedValue { $0 } == 1)
+        #expect(!owner.inEventLoop)
+
+        let cancelCalled = DispatchGroup()
+        cancelCalled.enter()
+        other.execute {
+            #expect(!owner.inEventLoop)
+            #expect(other.inEventLoop)
+            task.cancel(promise: cancelPromise)
+            cancelCalled.leave()
+        }
+        cancelCalled.wait()
+        try owner.submit {}.wait()
+        #expect(!notifying.futureResult.isFulfilled)
+        #expect(!cancelPromise.futureResult.isFulfilled)
+
+        work.succeed(())
+        try notifying.futureResult.wait()
+        try cancelPromise.futureResult.wait()
+        #expect(notifiedOnOwner.withLockedValue { $0 })
+        try owner.scheduleTask(in: .milliseconds(20)) {}.futureResult.wait()
+        #expect(runs.withLockedValue { $0 } == 1)
+    }
+
+    @Test
     func testRepeatedTaskIsJittered() throws {
         let initialDelay = TimeAmount.minutes(5)
         let delay = TimeAmount.minutes(2)
